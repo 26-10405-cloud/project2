@@ -181,16 +181,40 @@ def walking_route(points):
     return line, route["distance"], route["duration"]
 
 
-def build_course(start, spots, n_stops):
-    """가까운 곳부터 이어 붙여 출발지로 돌아오는 순환 코스."""
-    chosen = random.sample(spots, min(n_stops, len(spots)))
-    ordered, cur = [], start
+WALK_M_PER_MIN = 80   # 보행 속도: 분당 약 80m
+DETOUR = 1.3          # 직선거리 대비 실제 도보 거리 보정
+
+
+def order_stops(start, chosen):
+    """가까운 곳부터 이어 붙이는 순서로 정렬."""
+    chosen, ordered, cur = list(chosen), [], start
     while chosen:
         nxt = min(chosen, key=lambda s: haversine(cur, (s["lat"], s["lon"])))
         ordered.append(nxt)
         chosen.remove(nxt)
         cur = (nxt["lat"], nxt["lon"])
     return ordered
+
+
+def loop_length(start, order):
+    """출발지 → 장소들 → 출발지 순환 코스의 대략적인 도보 거리(m)."""
+    pts = [start] + [(s["lat"], s["lon"]) for s in order] + [start]
+    return sum(haversine(p, q) for p, q in zip(pts, pts[1:])) * DETOUR
+
+
+def build_courses(start, spots, n_stops, target_m, tries=300, keep=4):
+    """목표 거리에 가장 가까운 코스 후보를 좋은 순서로 여러 개 돌려준다."""
+    n = min(n_stops, len(spots))
+    seen, cands = set(), []
+    for _ in range(tries):
+        order = order_stops(start, random.sample(spots, n))
+        key = tuple(x["name"] for x in order)
+        if key in seen:
+            continue
+        seen.add(key)
+        cands.append((abs(loop_length(start, order) - target_m), order))
+    cands.sort(key=lambda x: x[0])
+    return [o for _, o in cands[:keep]]
 
 
 KIND_WHY = {
@@ -221,7 +245,7 @@ def explain_course(res):
         f"**코스 구성**: 가까운 장소부터 차례로 이어서 불필요하게 돌아가지 않게 했고, "
         f"마지막에는 출발지로 돌아오는 순환 코스라 다시 이동할 필요가 없어요.")
     diff = res["dur"] / 60 - res["minutes"]
-    if abs(diff) <= 10:
+    if abs(diff) <= max(5, res["minutes"] * 0.2):
         fit = "원하신 시간과 거의 맞아요."
     elif diff > 0:
         fit = "원하신 시간보다 조금 길어요. 장소 수를 줄이면 더 짧아져요."
@@ -268,7 +292,7 @@ minutes = c1.slider("걷고 싶은 시간(분)", 20, 90, 40, step=10)
 n_stops = c2.slider("들를 장소 수", 1, 3, 2)
 
 if st.button("산책 코스 추천받기", type="primary", disabled=start is None):
-    radius = int(minutes * 80 / 2.2)  # 보행속도 약 80m/분, 왕복 고려
+    radius = int(minutes * WALK_M_PER_MIN / (2 * DETOUR))  # 왕복·우회 고려한 최대 거리
     cfg = MOODS[mood]
     with st.spinner("근처 예쁜 장소를 찾는 중..."):
         try:
@@ -280,14 +304,24 @@ if st.button("산책 코스 추천받기", type="primary", disabled=start is Non
         st.warning("근처에서 장소를 못 찾았어요. 시간을 늘려보세요.")
         st.stop()
 
-    stops = build_course(start, spots, n_stops)
-    pts = [start] + [(s["lat"], s["lon"]) for s in stops] + [start]
-    with st.spinner("도보 경로 계산 중..."):
-        try:
-            line, dist, dur = walking_route(tuple(pts))
-        except Exception as e:
-            st.error(f"경로 계산 실패: {e}")
-            st.stop()
+    target_s = minutes * 60
+    best = None
+    with st.spinner("목표 시간에 맞는 코스를 계산하는 중..."):
+        for stops in build_courses(start, spots, n_stops, minutes * WALK_M_PER_MIN):
+            pts = [start] + [(x["lat"], x["lon"]) for x in stops] + [start]
+            try:
+                line, dist, dur = walking_route(tuple(pts))
+            except Exception:
+                continue
+            err = abs(dur - target_s)
+            if best is None or err < best[0]:
+                best = (err, stops, line, dist, dur)
+            if err <= target_s * 0.15:  # 목표와 15% 이내면 충분히 가까움
+                break
+    if best is None:
+        st.error("경로 계산에 실패했어요. 잠시 후 다시 시도해 주세요.")
+        st.stop()
+    _, stops, line, dist, dur = best
     st.session_state["result"] = dict(start=start, stops=stops, line=line,
                                       dist=dist, dur=dur, mood=mood, why=cfg["why"],
                                       minutes=minutes)
