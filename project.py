@@ -112,31 +112,37 @@ def spot_kind(t: dict) -> str:
 
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
 ]
+FETCH_RADIUS = 3500  # 항상 같은 반경으로 한 번에 검색 → 시간을 바꿔도 캐시 재사용
 
 
 def overpass_query(q: str):
     """여러 Overpass 서버를 돌아가며 시도. 빈 응답/오류면 다음 서버로."""
-    last = "응답 없음"
-    for url in OVERPASS_URLS:
-        for _ in range(2):
+    fails = []
+    for rnd in range(2):  # 전체 서버를 최대 2바퀴
+        for url in OVERPASS_URLS:
+            host = url.split("/")[2]
             try:
-                r = requests.post(url, data={"data": q}, headers=UA, timeout=40)
+                r = requests.post(url, data={"data": q}, headers=UA, timeout=45)
                 if r.status_code == 200:
                     return r.json()
-                last = f"{url} → HTTP {r.status_code}"
+                fails.append(f"{host}: HTTP {r.status_code}")
             except Exception as e:
-                last = f"{url} → {e}"
-            time.sleep(1.5)
-    raise RuntimeError(f"장소 검색 서버가 모두 응답하지 않아요. 잠시 후 다시 시도해 주세요. ({last})")
+                fails.append(f"{host}: {type(e).__name__}")
+        time.sleep(2 * (rnd + 1))
+    raise RuntimeError("장소 검색 서버가 모두 응답하지 않아요. 1~2분 뒤 다시 눌러주세요. ("
+                       + ", ".join(fails[-5:]) + ")")
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def find_spots(lat, lon, radius, tags):
-    parts = "".join(f"nwr{t}(around:{radius},{lat},{lon});" for t in tags)
-    q = f"[out:json][timeout:25];({parts});out center 60;"
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_spots(lat, lon, tags):
+    """고정 반경으로 장소를 한 번에 가져와 캐시한다."""
+    parts = "".join(f"nwr{t}(around:{FETCH_RADIUS},{lat},{lon});" for t in tags)
+    q = f"[out:json][timeout:25];({parts});out center 200;"
     data = overpass_query(q)
     spots, seen = [], set()
     for el in data.get("elements", []):
@@ -149,6 +155,19 @@ def find_spots(lat, lon, radius, tags):
         spots.append({"name": name, "lat": c[0], "lon": c[1],
                       "kind": spot_kind(el.get("tags", {}))})
     return spots
+
+
+def find_spots(lat, lon, radius, tags):
+    """걷는 시간에 맞는 반경 안의 장소만 골라 돌려준다."""
+    # 좌표를 소수 3자리(약 100m)로 맞춰 같은 동네는 같은 캐시를 쓰게 한다
+    allspots = fetch_spots(round(lat, 3), round(lon, 3), tags)
+    here = (lat, lon)
+    for s in allspots:
+        s["dist"] = haversine(here, (s["lat"], s["lon"]))
+    near = [s for s in allspots if s["dist"] <= radius]
+    if not near:  # 반경 안에 없으면 가장 가까운 몇 곳이라도 사용
+        near = sorted(allspots, key=lambda s: s["dist"])[:5]
+    return near
 
 
 @st.cache_data(ttl=600, show_spinner=False)
